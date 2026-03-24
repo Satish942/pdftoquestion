@@ -12,6 +12,16 @@ from firebase_admin import credentials, firestore
 
 st.set_page_config(page_title="AI PDF Quiz (Streamlit)", layout="wide")
 
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Ubuntu:wght@300;400;500;700&display=swap');
+
+html, body, [class*="css"], [class*="st-"], p, h1, h2, h3, h4, h5, h6, div, span, label, button, input, textarea {
+    font-family: 'Ubuntu', sans-serif !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 @st.cache_resource
 def init_db():
     try:
@@ -92,6 +102,34 @@ if "final_result_id" not in st.session_state:
 def navigate(page):
     st.session_state.page = page
 
+@st.dialog("Confirm Deletion")
+def confirm_delete_library(source_id):
+    st.error("⚠️ Are you sure you want to permanently remove this library and all its associated data?")
+    c1, c2 = st.columns(2)
+    if c1.button("Yes, Remove", type="primary"):
+        with st.spinner("Deleting from database..."):
+            if db:
+                batch = db.batch()
+                
+                # Delete Questions
+                qs = db.collection("questions").where("sourceId", "==", source_id).stream()
+                for q in qs:
+                    batch.delete(q.reference)
+                    
+                # Delete Results
+                results = db.collection("results").where("sourceId", "==", source_id).stream()
+                for r in results:
+                    batch.delete(r.reference)
+                    
+                # Delete Source Document
+                batch.delete(db.collection("sources").document(source_id))
+                batch.commit()
+                
+        time.sleep(1)
+        st.rerun()
+    if c2.button("No, Cancel"):
+        st.rerun()
+
 # --- VIEWS ---
 
 def view_dashboard():
@@ -107,17 +145,25 @@ def view_dashboard():
         if st.button("Process Document", type="primary", use_container_width=True):
             if uploaded_file and num_questions > 0:
                 with st.spinner(f"Reading {uploaded_file.name} & querying Gemini..."):
+                    from pypdf import PdfReader, PdfWriter
                     reader = PdfReader(uploaded_file)
-                    text_content = ""
+                    writer = PdfWriter()
                     for i in range(min(50, len(reader.pages))):
-                        text_content += reader.pages[i].extract_text() + "\n"
+                        writer.add_page(reader.pages[i])
+                    
+                    pdf_bytes_io = io.BytesIO()
+                    writer.write(pdf_bytes_io)
+                    pdf_bytes = pdf_bytes_io.getvalue()
                     
                     try:
                         client = get_gemini_client()
-                        prompt = f"Extract comprehensive knowledge from the following text and formulate exactly {num_questions} difficult exam questions testing the concepts.\nTEXT:\n{text_content[:80000]}"
+                        prompt = f"Analyze the entire document comprehensively, including any diagrams, pictures, graphs, and formatting. Formulate exactly {num_questions} difficult exam questions testing the core concepts. In your explanations, make sure to completely explain the logic using the formatting and visual information shown in the PDF's pictures/diagrams if relevant."
+                        
+                        pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf')
+
                         response = client.models.generate_content(
                             model='gemini-2.5-flash',
-                            contents=prompt,
+                            contents=[pdf_part, prompt],
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 response_schema=QuestionList,
@@ -154,9 +200,9 @@ def view_dashboard():
                 with st.container(border=True):
                     st.write(f"**{data.get('fileName')}**")
                     st.caption(f"{data.get('totalQuestions')} questions generated")
-                    c_input, c_btn = st.columns([1, 2])
+                    c_input, c_btn, c_del = st.columns([1.5, 2, 0.5])
                     with c_input:
-                        limit = st.number_input("Limit", value=min(20, data.get('totalQuestions')), min_value=1, max_value=data.get('totalQuestions'), key=f"lim_{d.id}")
+                        limit = st.number_input("Limit", value=min(20, data.get('totalQuestions', 1)), min_value=1, max_value=data.get('totalQuestions', 1), key=f"lim_{d.id}")
                     with c_btn:
                         st.write("") # spacer
                         if st.button("Start Quiz", key=f"start_{d.id}", use_container_width=True):
@@ -170,6 +216,10 @@ def view_dashboard():
                             st.session_state.quiz_start_time = time.time()
                             navigate("quiz")
                             st.rerun()
+                    with c_del:
+                        st.write("") # spacer
+                        if st.button("R", key=f"del_{d.id}", help="Remove Library", use_container_width=True):
+                            confirm_delete_library(d.id)
                             
     st.divider()
     st.subheader("Score History")
